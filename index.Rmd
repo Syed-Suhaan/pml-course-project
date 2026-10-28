@@ -1,0 +1,295 @@
+---
+title: "Predicting How Well a Dumbbell Curl Is Done"
+subtitle: "Practical Machine Learning course project"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.align = "center",
+                      fig.width = 7, fig.height = 4)
+library(caret)
+library(randomForest)
+library(ggplot2)
+pct <- function(x, digits = 1) sprintf("%.*f%%", digits, 100 * x)
+```
+
+## Overview
+
+The question is whether wearable sensors can tell a correct dumbbell curl from
+four common mistakes. This report cleans the sensor data, compares a single
+classification tree with a random forest using 5-fold cross-validation,
+estimates the forest's out-of-sample error on a held-back validation set, and
+then checks how well the model carries over to a person it has never seen.
+The [conclusion](#conclusion) collects the numbers.
+
+## Data
+
+Six participants did sets of ten dumbbell biceps curls in five ways while
+sensors on the belt, upper arm, forearm and dumbbell recorded their movement
+(Velloso et al., 2013). Class A is the correct technique. The others are
+common mistakes: throwing the elbows to the front (B), lifting only halfway
+(C), lowering only halfway (D) and throwing the hips to the front (E). Each
+row of the data is one reading taken from the continuous sensor stream.
+
+```{r load}
+urls <- c("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+          "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+files <- file.path("data", basename(urls))
+dir.create("data", showWarnings = FALSE)
+for (i in seq_along(urls)) {
+  if (!file.exists(files[i])) download.file(urls[i], files[i], mode = "wb")
+}
+
+na_strings <- c("NA", "", "#DIV/0!")
+raw  <- read.csv(files[1], na.strings = na_strings)
+test <- read.csv(files[2], na.strings = na_strings)
+dim(raw)
+dim(test)
+table(raw$classe)
+```
+
+## Choosing the predictors
+
+Of the 159 candidate columns, only 52 are usable. Two groups go.
+
+**Window summaries.** The sensors' stream was cut into short time windows, and
+100 columns hold statistics for each window (kurtosis, skewness, maximum,
+variance and so on). They are filled in only on the
+`r sum(raw$new_window == "yes")` rows that close a window and are empty on all
+20 test rows, so a model could never use them at prediction time.
+
+```{r missing}
+na_share <- colMeans(is.na(raw))
+table(cut(na_share, c(-Inf, 0, 0.97, 1),
+          labels = c("no missing values", "up to 97% missing", "over 97% missing")))
+```
+
+**Bookkeeping columns.** The first seven columns describe the recording, not
+the movement, and some of them leak the answer. `X` is the row number, and the
+file is sorted by class, so `X` separates the classes perfectly in the training
+data and means nothing anywhere else:
+
+```{r leak}
+tapply(raw$X, raw$classe, range)
+mean(test$num_window %in% raw$num_window)
+```
+
+The window number is just as dangerous. Every test row comes from a window
+that also appears in the training file, so looking up `num_window` would score
+20 out of 20 on the quiz while learning nothing about how anyone lifts. The
+timestamps play the same role. The participant's name is dropped too, so the
+model has to rely on the sensors.
+
+```{r clean}
+bookkeeping <- c("X", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2",
+                 "cvtd_timestamp", "new_window", "num_window")
+predictors <- setdiff(names(raw)[na_share == 0], c(bookkeeping, "classe"))
+data <- data.frame(raw[predictors], classe = factor(raw$classe))
+
+length(predictors)
+length(nearZeroVar(data[predictors]))
+```
+
+The 52 predictors that remain are the roll, pitch, yaw and total acceleration
+of each of the four sensors, plus their x, y and z gyroscope, accelerometer and
+magnetometer readings. None has near-zero variance, so no further filtering is
+needed.
+
+## Cross-validation design
+
+The data is used in two layers so that the final error estimate is honest.
+
+1. **A validation set.** 25% of the rows, stratified by class, are set aside
+   before any modelling. They are used once, at the end, to estimate the
+   out-of-sample error of the chosen model.
+2. **5-fold cross-validation** on the other 75% picks the model and tunes it.
+   Both models below use the same five folds, so their scores are directly
+   comparable.
+
+Five folds is a practical middle ground. Each fold still trains on about
+`r format(round(0.75 * 0.8 * nrow(data), -2), big.mark = ",")` rows, so the
+estimate is not pessimistic, and it costs half the model fits of 10-fold
+cross-validation, which matters for a random forest.
+
+```{r split}
+set.seed(2026)
+in_fit <- createDataPartition(data$classe, p = 0.75, list = FALSE)
+fit_set    <- data[in_fit, ]
+validation <- data[-in_fit, ]
+folds <- createFolds(fit_set$classe, k = 5, returnTrain = TRUE)
+ctrl  <- trainControl(method = "cv", index = folds)
+c(fit_set = nrow(fit_set), validation = nrow(validation))
+```
+
+## Models
+
+**Baseline: a single classification tree.** A tree is easy to read and sets a
+floor. Its complexity parameter `cp` is tuned over ten values.
+
+**Main model: a random forest.** The boundaries between the classes are
+unlikely to be simple. A mistake such as throwing the hips forward shows up as
+a combination of belt, arm and dumbbell movement, and many of the 52 readings
+are strongly correlated with each other. A random forest handles nonlinear
+boundaries, interactions and correlated inputs without scaling or feature
+engineering, and averaging many trees makes it far more stable than one tree.
+The number of predictors tried at each split, `mtry`, is tuned over 2, 7 (close
+to the usual default of √52), 14 and 27. Each forest has 150 trees.
+
+```{r models}
+tree_fit <- train(classe ~ ., data = fit_set, method = "rpart",
+                  tuneLength = 10, trControl = ctrl)
+
+set.seed(2026)
+rf_fit <- train(classe ~ ., data = fit_set, method = "rf", ntree = 150,
+                tuneGrid = data.frame(mtry = c(2, 7, 14, 27)), trControl = ctrl)
+```
+
+```{r cv-table}
+knitr::kable(data.frame(
+  model = c("Classification tree", "Random forest"),
+  best_setting = c(sprintf("cp = %.4f", tree_fit$bestTune$cp),
+                   sprintf("mtry = %d", rf_fit$bestTune$mtry)),
+  cv_accuracy = pct(c(max(tree_fit$results$Accuracy), max(rf_fit$results$Accuracy)), 2)
+), col.names = c("Model", "Best setting", "5-fold CV accuracy"))
+```
+
+The tree gets `r pct(max(tree_fit$results$Accuracy), 0)` of the readings
+right and the forest almost all of them, so the forest is the model carried
+forward. Figure 1 shows that `mtry` barely matters. Every value tried scores at
+least `r pct(min(rf_fit$results$Accuracy), 1)`, and the best and worst differ
+by `r round(100 * diff(range(rf_fit$results$Accuracy)), 2)` percentage points
+(note the narrow y axis). The forest's own out-of-bag error is already
+`r pct(rf_fit$finalModel$err.rate[50, "OOB"], 2)` at 50 trees and
+`r pct(rf_fit$finalModel$err.rate[150, "OOB"], 2)` at 150, so more trees would
+not change the result.
+
+```{r fig-mtry, fig.cap = "Figure 1. Cross-validated accuracy of the random forest for each value of mtry."}
+ggplot(rf_fit) +
+  labs(x = "Predictors tried at each split (mtry)", y = "5-fold CV accuracy") +
+  theme_minimal()
+```
+
+Figure 2 shows which readings the forest leans on most.
+
+```{r fig-importance, fig.height = 4.5, fig.cap = "Figure 2. The 15 most important predictors (mean decrease in Gini impurity, scaled to 100)."}
+importance <- varImp(rf_fit)
+top_three <- head(rownames(importance$importance)[order(-importance$importance$Overall)], 3)
+plot(importance, top = 15, xlab = "Relative importance")
+```
+
+The three most important are `r knitr::combine_words(top_three, before = "\x60")`.
+
+## Expected out-of-sample error
+
+The chosen forest now predicts the validation set, which played no part in
+fitting or tuning.
+
+```{r validate}
+cm <- confusionMatrix(predict(rf_fit, validation), validation$classe)
+cm$table
+
+accuracy    <- unname(cm$overall["Accuracy"])
+accuracy_ci <- unname(cm$overall[c("AccuracyLower", "AccuracyUpper")])
+oos_error   <- 1 - accuracy
+tree_accuracy <- mean(predict(tree_fit, validation) == validation$classe)
+```
+
+Validation accuracy is **`r pct(accuracy, 2)`**, so the estimated
+out-of-sample error is **`r pct(oos_error, 2)`**, with a 95% confidence
+interval of `r pct(1 - accuracy_ci[2], 2)` to `r pct(1 - accuracy_ci[1], 2)`.
+Sensitivity is between `r pct(min(cm$byClass[, "Sensitivity"]), 1)` and
+`r pct(max(cm$byClass[, "Sensitivity"]), 1)` across the five classes, so no
+single mistake type is being missed. The cross-validation estimate,
+`r pct(max(rf_fit$results$Accuracy), 2)`, agrees, which is a sign the model
+was not overfitted to the folds. The tree, for comparison, scores
+`r pct(tree_accuracy, 1)` on the same rows.
+
+With an error rate this low, the chance of getting all 20 test cases right is
+roughly (1 − `r round(oos_error, 4)`)^20^ ≈ `r pct((1 - oos_error)^20, 0)`.
+
+One caveat shapes how far this number reaches. The readings are a continuous
+stream, so for almost every validation row, the readings taken a split second
+before and after it are in the training set. That makes the task easier than
+classifying a fresh recording. It is also exactly the situation of the 20 test
+cases, whose windows all appear in the training data, so the estimate is the
+right one for them.
+
+## How well does this carry over to a new person?
+
+To see how the model would do on someone it has never seen, the forest is
+refitted six times, each time leaving out one participant entirely and then
+predicting that person's readings. It uses the tuned `mtry` and 150 trees.
+
+```{r loso}
+subjects <- raw$user_name
+set.seed(2026)
+loso_accuracy <- sapply(sort(unique(subjects)), function(s) {
+  held_out <- subjects == s
+  model <- randomForest(classe ~ ., data = data[!held_out, ], ntree = 150,
+                        mtry = rf_fit$bestTune$mtry)
+  mean(predict(model, data[held_out, ]) == data$classe[held_out])
+})
+always_a <- tapply(data$classe == "A", subjects, mean)
+round(rbind(forest = loso_accuracy, always_guess_A = always_a), 3)
+```
+
+```{r fig-loso, fig.height = 3.5, fig.cap = "Figure 3. Accuracy on each participant when that participant is left out of training. The dashed line is the validation accuracy for known participants."}
+ggplot(data.frame(subject = names(loso_accuracy), accuracy = loso_accuracy),
+       aes(reorder(subject, accuracy), accuracy)) +
+  geom_col(fill = "steelblue") +
+  geom_hline(yintercept = accuracy, linetype = "dashed") +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = NULL, y = "Accuracy on the held-out person") +
+  coord_flip() +
+  theme_minimal()
+```
+
+Accuracy on an unseen person averages `r pct(mean(loso_accuracy), 0)`, far
+below the `r pct(accuracy, 1)` for known people. For
+`r sum(loso_accuracy < always_a)` of the six it is worse than always guessing
+class A. The likely reason, not tested here, is that raw readings depend on the
+person as well as on the technique, through body size, strength and how the
+sensors sat on them. If so, a forest trained on raw readings learns in part
+what each of the six people looks like. That is harmless for the quiz, but a
+real coaching app would need more than six people in training, calibration for
+each new user, or features that describe whole repetitions rather than single
+readings.
+
+## Predictions for the 20 test cases
+
+The test rows get the same 52 predictors and are classified by the validated
+random forest.
+
+```{r predict}
+test_pred <- predict(rf_fit, test[predictors])
+knitr::kable(t(data.frame(problem = test$problem_id, prediction = test_pred)))
+```
+
+## Conclusion
+
+A random forest on 52 raw sensor readings, with `mtry` =
+`r rf_fit$bestTune$mtry` chosen by 5-fold cross-validation, classifies the five
+curl techniques with `r pct(accuracy, 2)` accuracy on an untouched validation
+set. The expected out-of-sample error is **`r pct(oos_error, 2)`** (95% CI
+`r pct(1 - accuracy_ci[2], 2)` to `r pct(1 - accuracy_ci[1], 2)`) for new
+readings from the six people in the study, which is the setting of the 20 test
+cases. For a person outside the study, expect far more errors. Accuracy on a
+left-out participant ranged from `r pct(min(loso_accuracy), 0)` to
+`r pct(max(loso_accuracy), 0)`.
+
+## Reference
+
+Velloso, E., Bulling, A., Gellersen, H., Ugulino, W. and Fuks, H. (2013).
+*Qualitative Activity Recognition of Weight Lifting Exercises.* Proceedings of
+the 4th International Conference in Cooperation with SIGCHI (Augmented
+Human '13). Stuttgart, Germany: ACM SIGCHI. Data from the
+[Weight Lifting Exercise Dataset](http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har),
+used with thanks to the authors.
+
+Built with `r R.version.string`, caret `r packageVersion("caret")` and
+randomForest `r packageVersion("randomForest")`.
